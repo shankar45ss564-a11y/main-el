@@ -1,0 +1,15 @@
+pydantic
+
+{
+  "patientId": "patient-12345",
+  "careContexts": [
+    {
+      "id": "cc-001",
+      "referenceNumber": "OPD-2025-001"
+    },
+    {
+      "id": "cc-002",
+      "referenceNumber": "IPD-2025-005"
+    }
+  ]
+}
