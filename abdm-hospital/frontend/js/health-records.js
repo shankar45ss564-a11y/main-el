@@ -35,6 +35,12 @@ document.addEventListener("DOMContentLoaded", function () {
     .getElementById("clearFiltersBtn")
     .addEventListener("click", clearFilters);
 
+  // OCR scan & fill
+  const scanBtn = document.getElementById("scanFillBtn");
+  if (scanBtn) {
+    scanBtn.addEventListener("click", handleScanAndFill);
+  }
+
   // Check for URL params
   const urlParams = new URLSearchParams(window.location.search);
   const patientId = urlParams.get("patient_id");
@@ -85,6 +91,84 @@ async function loadHealthRecords() {
                 </td>
             </tr>
         `;
+  } finally {
+    utils.hideLoading();
+  }
+}
+
+// Handle Scan & Fill (upload image to backend OCR endpoint and fill form)
+async function handleScanAndFill(e) {
+  e.preventDefault();
+  const patientId = document.getElementById("patientId").value.trim();
+  if (!patientId) {
+    utils.showError("Please enter Patient ID before scanning");
+    return;
+  }
+
+  const input = document.getElementById("prescriptionImage");
+  if (!input || !input.files || input.files.length === 0) {
+    utils.showError("Please upload or choose an image file first");
+    return;
+  }
+
+  const file = input.files[0];
+  const fd = new FormData();
+  fd.append("file", file, file.name);
+
+  try {
+    utils.showLoading();
+    const resp = await fetch(`/api/health-records/${encodeURIComponent(patientId)}/scan`, {
+      method: "POST",
+      body: fd,
+    });
+
+    if (!resp.ok) {
+      const txt = await resp.text();
+      throw new Error(txt || `Server responded ${resp.status}`);
+    }
+
+    const payload = await resp.json();
+
+    if (!payload || !payload.success) {
+      throw new Error(payload.error || "Failed to extract data from image");
+    }
+
+    const data = payload.data || {};
+
+    // Map known fields to form inputs
+    // Set record type to Prescription
+    document.getElementById("recordType").value = "Prescription";
+    document.getElementById("title").value = data.patient_name
+      ? `Prescription - ${data.patient_name}`
+      : "Prescription";
+
+    // Build content from available fields
+    const parts = [];
+    if (data.symptoms) parts.push(`Symptoms: ${data.symptoms}`);
+    if (data.prescription) parts.push(`Prescription: ${data.prescription}`);
+    if (data.dosage) parts.push(`Dosage: ${data.dosage}`);
+    if (data.doctor_notes) parts.push(`Notes: ${data.doctor_notes}`);
+
+    document.getElementById("content").value = parts.join("\n\n") || "";
+
+    if (data.doctor_name) {
+      document.getElementById("doctorName").value = data.doctor_name;
+    }
+
+    utils.showSuccess("Form auto-filled from image OCR. Please review before saving.");
+    // show preview if available
+    try {
+      const preview = document.getElementById('prescriptionPreview');
+      const img = document.getElementById('prescriptionPreviewImg');
+      if (preview && img && input.files && input.files[0]) {
+        img.src = URL.createObjectURL(input.files[0]);
+        preview.style.display = 'block';
+      }
+    } catch (err) {
+      // ignore preview errors
+    }
+  } catch (error) {
+    utils.showError("Scan failed: " + (error.message || error));
   } finally {
     utils.hideLoading();
   }

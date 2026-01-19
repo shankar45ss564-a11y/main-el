@@ -3,7 +3,24 @@ Health Records API Routes for ABDM Hospital.
 Provides endpoints to view, manage, and track health records.
 """
 
-from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi import APIRouter, HTTPException, Depends, Query, UploadFile, File
+import shutil
+import tempfile
+import os
+import json
+import logging
+
+# Third-party ML clients used by the on-device OCR + parsing flow
+try:
+    from gradio_client import Client, handle_file
+except Exception:
+    Client = None
+    handle_file = None
+
+try:
+    import google.genai as genai
+except Exception:
+    genai = None
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 from datetime import datetime
@@ -461,3 +478,172 @@ async def get_records_from_hospital(
 # ============================================================================
 # Additional Helper Endpoints
 # ============================================================================
+
+
+# ---------------------------------------------------------------------
+# ML helpers (migrated from ml.py)
+# ---------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class GeminiConfig:
+    @staticmethod
+    def api_key() -> str:
+        key = os.getenv("GEMINI_API_KEY")
+        if not key:
+            raise RuntimeError("GEMINI_API_KEY is not configured")
+        return key
+
+    @staticmethod
+    def model() -> str:
+        return os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+    @staticmethod
+    def system_prompt() -> str:
+        return os.getenv(
+            "GEMINI_SYSTEM_PROMPT",
+            (
+                "You are an AI that extracts structured data from medical prescriptions.\n"
+                "Extract ONLY the following fields:\n"
+                "- patient_name\n"
+                "- doctor_name\n"
+                "- symptoms\n"
+                "- prescription\n"
+                "- dosage\n"
+                "- doctor_notes\n\n"
+                "Rules:\n"
+                "1. Return ONLY a valid JSON object.\n"
+                "2. No explanations, no markdown.\n"
+                "3. Use null if a field is missing."
+            )
+        )
+
+
+def _initialize_gemini_client() -> "genai.Client":
+    if genai is None:
+        raise RuntimeError("google.genai is not installed in the environment")
+    return genai.Client(api_key=GeminiConfig.api_key())
+
+
+def _build_prompt(ocr_text: str) -> str:
+    return f"""
+Prescription Text:
+{ocr_text}
+
+Expected JSON format:
+{{
+  "patient_name": null,
+  "doctor_name": null,
+  "symptoms": null,
+  "prescription": null,
+  "dosage": null,
+  "doctor_notes": null
+}}
+""".strip()
+
+
+def _parse_json_safely(text: str):
+    cleaned = text.strip()
+
+    if cleaned.startswith("```"):
+        cleaned = cleaned.removeprefix("```json").removeprefix("```")
+        cleaned = cleaned.removesuffix("```").strip()
+
+    return json.loads(cleaned)
+
+
+async def extract_structured_data(ocr_text: str):
+    try:
+        if not ocr_text or not ocr_text.strip():
+            raise ValueError("OCR text is empty")
+
+        client = _initialize_gemini_client()
+
+        full_prompt = (
+            f"{GeminiConfig.system_prompt()}\n\n"
+            f"{_build_prompt(ocr_text)}"
+        )
+
+        response = await client.aio.models.generate_content(
+            model=GeminiConfig.model(),
+            contents=[
+                {
+                    "role": "user",
+                    "parts": [{"text": full_prompt}],
+                }
+            ],
+        )
+
+        structured_data = _parse_json_safely(response.text)
+
+        return {
+            "success": True,
+            "data": structured_data,
+            "error": None,
+        }
+
+    except Exception as exc:
+        logger.exception("Structured extraction failed")
+        return {
+            "success": False,
+            "data": None,
+            "error": str(exc),
+        }
+
+
+# ---------------------------------------------------------------------
+# Endpoint: upload image, run OCR (gradio model), then parse with Gemini
+# ---------------------------------------------------------------------
+@router.post("/{patient_id}/scan")
+async def scan_and_extract_prescription(
+    patient_id: str,
+    file: UploadFile = File(...),
+):
+    """
+    Accept an image upload (camera/photo of prescription), run OCR using the
+    Gradio demo model and then call Gemini-based extraction to return a
+    structured JSON that can be used to pre-fill the create-record form.
+    """
+    if Client is None or handle_file is None:
+        raise HTTPException(status_code=500, detail="OCR client not available on server")
+
+    # Save uploaded file to a temp location
+    tmpdir = tempfile.mkdtemp()
+    try:
+        filename = file.filename or "upload.png"
+        tmp_path = os.path.join(tmpdir, filename)
+        with open(tmp_path, "wb") as out_f:
+            shutil.copyfileobj(file.file, out_f)
+
+        try:
+            client = Client("khang119966/DeepSeek-OCR-DEMO")
+            result = client.predict(
+                image=handle_file(tmp_path),
+                model_size="Gundam (Recommended)",
+                task_type="📝 Free OCR",
+                ref_text="Hello!!",
+                api_name="/process_ocr_task",
+            )
+
+            raw_text = result[0] if isinstance(result, (list, tuple)) else result
+
+            extraction = await extract_structured_data(raw_text)
+
+            return {
+                "success": extraction.get("success", False),
+                "ocr_text": raw_text,
+                "data": extraction.get("data"),
+                "error": extraction.get("error"),
+            }
+
+        except Exception as exc:
+            logger.exception("Scan or extraction failed")
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    finally:
+        try:
+            shutil.rmtree(tmpdir)
+        except Exception:
+            pass
+
